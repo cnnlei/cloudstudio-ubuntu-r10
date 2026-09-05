@@ -1,0 +1,16 @@
+version: "v1"
+image: "ubuntu:24.04"
+lifecycle:
+  init:
+    - name: "初始化 Ubuntu + CodeBuddy + r10"
+      command: "chmod +x ./install.sh ./cloudstudio-r10.sh && ./install.sh"
+name: "Ubuntu 24.04 + CodeBuddy + r10"
+description: "CloudStudio Ubuntu 母版：CodeBuddy CLI + r10/netapp/Supervisor 保活"
+tags:
+  - "Ubuntu"
+  - "CodeBuddy"
+  - "r10"
+storage:
+  copy_to_working_dir: true
+category: "userDefined"
+show: true

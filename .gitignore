@@ -1,0 +1,16 @@
+# Secrets / machine identity
+.env
+*.key
+*.pem
+*.crt
+.cs-token
+.relay-key
+
+# Runtime files
+.cloudstudio-manager/
+*.log
+*.pid
+
+# Tailscale / SSH identity must never be committed
+var-lib-tailscale/
+ssh_host_*
