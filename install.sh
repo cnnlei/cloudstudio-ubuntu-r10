@@ -14,11 +14,55 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 export DEBIAN_FRONTEND=noninteractive
+
+# CloudStudio 某些官方镜像预置的 GitHub CLI APT 源可能出现签名过期/
+# 公钥缺失。它与本模板无关，但会让 apt-get update 整体失败。
+# 首次 update 失败时，仅临时跳过 cli.github.com/packages 对应源，
+# 安装完基础依赖后再恢复，避免永久改动用户的软件源配置。
+APT_DISABLED_SOURCES=()
+
+restore_apt_sources() {
+  local item src dst
+  for item in "${APT_DISABLED_SOURCES[@]:-}"; do
+    src="${item%%|*}"
+    dst="${item#*|}"
+    [ -e "$src" ] && mv -f "$src" "$dst" || true
+  done
+}
+
+disable_broken_github_cli_sources() {
+  local f disabled=0
+  for f in /etc/apt/sources.list.d/*; do
+    [ -f "$f" ] || continue
+    grep -q 'cli\.github\.com/packages' "$f" 2>/dev/null || continue
+    case "$f" in
+      *.cloudstudio-template-disabled) continue ;;
+    esac
+    mv "$f" "$f.cloudstudio-template-disabled"
+    APT_DISABLED_SOURCES+=("$f.cloudstudio-template-disabled|$f")
+    disabled=1
+    say "临时跳过失效的 GitHub CLI APT 源：$f"
+  done
+  [ "$disabled" -eq 1 ]
+}
+
 say "安装基础依赖"
-apt-get update -qq
+if ! apt-get update -qq; then
+  say "apt-get update 失败，检查 CloudStudio 预置 GitHub CLI 软件源"
+  if disable_broken_github_cli_sources; then
+    apt-get update -qq
+  else
+    echo "APT 更新失败，且未检测到可自动跳过的 GitHub CLI 软件源" >&2
+    exit 1
+  fi
+fi
+
 apt-get install -y -qq \
   ca-certificates curl git openssh-server python3 procps util-linux coreutils \
   xz-utils tar gzip jq >/dev/null
+
+restore_apt_sources
+APT_DISABLED_SOURCES=()
 
 install_node_exact() {
   local arch node_arch tmp url
