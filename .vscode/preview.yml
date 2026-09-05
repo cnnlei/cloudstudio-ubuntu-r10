@@ -1,7 +1,12 @@
 apps:
   - port: 65530
-    run: "cs-init status"
+    run: >-
+      if ! grep -Fq '# VERSION: 2026.09.05-r10' /usr/local/sbin/cs-init 2>/dev/null;
+      then chmod +x ./install.sh ./cloudstudio-r10.sh && bash ./install.sh ||
+      { echo 'r10 install failed'; exit 1; }; fi;
+      /usr/local/sbin/start-all.sh >/tmp/cloudstudio-r10-start.log 2>&1 || true;
+      tail -f /dev/null
     root: ./
-    name: "r10 状态"
-    autoOpen: false
+    name: "CloudStudio r10"
+    autoOpen: true
     autoPreview: false
