@@ -1,1 +1,7 @@
-
+apps:
+  - port: 65530
+    run: "cs-init status"
+    root: ./
+    name: "r10 状态"
+    autoOpen: false
+    autoPreview: false
