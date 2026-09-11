@@ -1,0 +1,301 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+NAME="gost-mws"
+IMAGE="gogost/gost:latest"
+
+echo
+echo "======================================"
+echo "       GOST MWS 一键部署"
+echo "======================================"
+echo
+
+# ==============================
+# 端口
+# ==============================
+
+printf "监听端口 [默认 38711]: " >/dev/tty
+IFS= read -r PORT </dev/tty
+PORT="${PORT:-38711}"
+
+if ! [[ "$PORT" =~ ^[0-9]+$ ]] ||
+   [ "$PORT" -lt 1 ] ||
+   [ "$PORT" -gt 65535 ]; then
+    echo "❌ 端口无效"
+    exit 1
+fi
+
+# ==============================
+# Path
+# ==============================
+
+if command -v uuidgen >/dev/null 2>&1; then
+    DEFAULT_PATH="/$(uuidgen | tr 'A-Z' 'a-z')"
+elif [ -r /proc/sys/kernel/random/uuid ]; then
+    DEFAULT_PATH="/$(cat /proc/sys/kernel/random/uuid)"
+else
+    DEFAULT_PATH="/$(date +%s)"
+fi
+
+printf "MWS Path [回车自动生成 %s]: " "$DEFAULT_PATH" >/dev/tty
+IFS= read -r MWS_PATH </dev/tty
+MWS_PATH="${MWS_PATH:-$DEFAULT_PATH}"
+
+# 自动补 /
+case "$MWS_PATH" in
+    /*) ;;
+    *) MWS_PATH="/$MWS_PATH" ;;
+esac
+
+# ==============================
+# 用户名
+# ==============================
+
+printf "用户名: " >/dev/tty
+IFS= read -r USERNAME </dev/tty
+
+if [ -z "$USERNAME" ]; then
+    echo "❌ 用户名不能为空"
+    exit 1
+fi
+
+# ==============================
+# 密码
+# ==============================
+
+printf "密码: " >/dev/tty
+IFS= read -rs PASSWORD </dev/tty
+echo >/dev/tty
+
+if [ -z "$PASSWORD" ]; then
+    echo "❌ 密码不能为空"
+    exit 1
+fi
+
+# ==============================
+# 环境检查
+# ==============================
+
+if ! command -v docker >/dev/null 2>&1; then
+    echo "❌ 未安装 Docker"
+    exit 1
+fi
+
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "❌ 未安装 Python3"
+    exit 1
+fi
+
+# ==============================
+# URL 编码
+#
+# 防止用户名/密码包含 @ : ? 等字符
+# ==============================
+
+export GOST_USER="$USERNAME"
+export GOST_PASS="$PASSWORD"
+export GOST_PATH="$MWS_PATH"
+
+ENC_USER="$(python3 - <<'PY'
+import os
+from urllib.parse import quote
+print(quote(os.environ["GOST_USER"], safe=""))
+PY
+)"
+
+ENC_PASS="$(python3 - <<'PY'
+import os
+from urllib.parse import quote
+print(quote(os.environ["GOST_PASS"], safe=""))
+PY
+)"
+
+ENC_PATH="$(python3 - <<'PY'
+import os
+from urllib.parse import quote
+print(quote(os.environ["GOST_PATH"], safe="/-._~"))
+PY
+)"
+
+LISTEN_URI="mws://${ENC_USER}:${ENC_PASS}@0.0.0.0:${PORT}?path=${ENC_PATH}"
+
+echo
+echo "======================================"
+echo "配置"
+echo "======================================"
+echo
+echo "协议   : mws"
+echo "监听   : 0.0.0.0:$PORT"
+echo "Path   : $MWS_PATH"
+echo "用户名 : $USERNAME"
+echo "密码   : 已设置"
+echo
+
+# ==============================
+# 删除旧容器
+# ==============================
+
+docker rm -f "$NAME" >/dev/null 2>&1 || true
+
+# ==============================
+# 检查端口
+# ==============================
+
+if ss -lnt 2>/dev/null | grep -qE ":${PORT}[[:space:]]"; then
+    echo "❌ 端口 $PORT 已被占用"
+    echo
+    ss -lntp | grep ":${PORT}" || true
+    exit 1
+fi
+
+# ==============================
+# 拉取镜像
+# ==============================
+
+echo "===== 拉取 GOST ====="
+
+docker pull "$IMAGE"
+
+echo
+echo "===== GOST 版本 ====="
+
+docker run --rm "$IMAGE" -V || true
+
+# ==============================
+# 启动
+# ==============================
+
+echo
+echo "===== 启动 GOST MWS ====="
+
+docker run -d \
+    --name "$NAME" \
+    --restart unless-stopped \
+    --network host \
+    "$IMAGE" \
+    -L "$LISTEN_URI" >/dev/null
+
+sleep 2
+
+# ==============================
+# 检查容器状态
+# ==============================
+
+RUNNING="$(
+    docker inspect \
+        -f '{{.State.Running}}' \
+        "$NAME" 2>/dev/null || true
+)"
+
+if [ "$RUNNING" != "true" ]; then
+    echo
+    echo "❌ GOST 启动失败"
+    echo
+    echo "===== 日志 ====="
+    docker logs "$NAME" || true
+    exit 1
+fi
+
+echo "✅ GOST 容器正在运行"
+
+# ==============================
+# 检查端口
+# ==============================
+
+if ! ss -lnt 2>/dev/null | grep -qE ":${PORT}[[:space:]]"; then
+    echo
+    echo "❌ 容器正在运行，但 $PORT 没有监听"
+    echo
+    echo "===== 日志 ====="
+    docker logs --tail 100 "$NAME" || true
+    exit 1
+fi
+
+echo "✅ 0.0.0.0:$PORT 已监听"
+
+# ==============================
+# 自动启动
+# ==============================
+
+POLICY="$(
+    docker inspect \
+        -f '{{.HostConfig.RestartPolicy.Name}}' \
+        "$NAME"
+)"
+
+echo "✅ Docker 重启策略：$POLICY"
+
+# ==============================
+# 显示最终效果
+# ==============================
+
+echo
+echo "======================================"
+echo "          ✅ 部署成功"
+echo "======================================"
+echo
+echo "服务端协议：mws"
+echo "监听端口：$PORT"
+echo "Path：$MWS_PATH"
+echo "用户名：$USERNAME"
+echo
+echo "实际 GOST 参数结构："
+echo
+echo '  "-L",'
+echo "  \"mws://${USERNAME}:***@0.0.0.0:${PORT}?path=${MWS_PATH}\""
+echo
+
+echo "===== 实际 Docker Cmd ====="
+docker inspect \
+    -f '{{json .Config.Cmd}}' \
+    "$NAME"
+
+echo
+echo
+echo "===== 端口 ====="
+ss -lntp | grep ":${PORT}" || true
+
+echo
+echo "===== 容器 ====="
+docker ps --filter "name=${NAME}"
+
+echo
+echo "======================================"
+echo "CloudStudio 端"
+echo "======================================"
+echo
+echo "开放端口："
+echo "  $PORT"
+echo
+echo "假设 CloudStudio 给你的地址是："
+echo
+echo "  xxxxxxxx--${PORT}.ap-shanghai2.cloudstudio.club"
+echo
+echo "那么外部客户端使用："
+echo
+echo "  协议     : mwss"
+echo "  地址     : xxxxxxxx--${PORT}.ap-shanghai2.cloudstudio.club"
+echo "  端口     : 443"
+echo "  Path     : $MWS_PATH"
+echo "  用户名   : $USERNAME"
+echo "  密码     : 你刚才输入的密码"
+echo
+echo "======================================"
+echo "常用命令"
+echo "======================================"
+echo
+echo "查看运行参数："
+echo "  docker inspect -f '{{json .Config.Cmd}}' $NAME"
+echo
+echo "查看状态："
+echo "  docker ps --filter name=$NAME"
+echo
+echo "查看日志："
+echo "  docker logs --tail 100 $NAME"
+echo
+echo "实时日志："
+echo "  docker logs -f $NAME"
+echo
+echo "重启："
+echo "  docker restart $NAME"
+echo
