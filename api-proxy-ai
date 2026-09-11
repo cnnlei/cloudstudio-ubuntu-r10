@@ -1,0 +1,455 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ============================================================
+# AI API 简易反代
+#
+# 功能：
+#   - 对外监听 0.0.0.0:30000
+#   - 默认上游 http://127.0.0.1:65530
+#   - 上游真实 API Key 交互输入
+#   - 对外 API Key 交互输入
+#   - 自动把客户端 Key 替换成上游真实 Key
+#   - 支持 OpenAI 兼容 API
+#   - 支持 SSE / 流式输出
+#   - Docker 部署
+#   - 开机自动启动
+#   - 部署前后自动检测
+# ============================================================
+
+NAME="ai-api-proxy"
+DIR="/opt/ai-api-proxy"
+PORT="30000"
+UPSTREAM="http://127.0.0.1:65530"
+
+echo
+echo "========================================"
+echo "       AI API 简易反代安装"
+echo "========================================"
+echo
+echo "上游地址 : $UPSTREAM"
+echo "监听地址 : 0.0.0.0:$PORT"
+echo
+
+# ============================================================
+# 输入 Key
+# ============================================================
+
+printf "请输入【上游真实 API Key】: " >/dev/tty
+IFS= read -r UPSTREAM_KEY </dev/tty
+
+printf "请输入【对外自定义 API Key】: " >/dev/tty
+IFS= read -r CLIENT_KEY </dev/tty
+
+echo
+
+if [ -z "$UPSTREAM_KEY" ]; then
+    echo "❌ 上游 API Key 不能为空"
+    exit 1
+fi
+
+if [ -z "$CLIENT_KEY" ]; then
+    echo "❌ 对外 API Key 不能为空"
+    exit 1
+fi
+
+# 防止特殊字符破坏 nginx.conf
+for KEY in "$UPSTREAM_KEY" "$CLIENT_KEY"; do
+    if ! printf '%s' "$KEY" | grep -Eq '^[A-Za-z0-9._-]+$'; then
+        echo "❌ API Key 只能包含："
+        echo "   字母、数字、点(.)、下划线(_)、横线(-)"
+        exit 1
+    fi
+done
+
+# ============================================================
+# 基础检查
+# ============================================================
+
+if ! command -v docker >/dev/null 2>&1; then
+    echo "❌ 未检测到 Docker"
+    exit 1
+fi
+
+if ! command -v curl >/dev/null 2>&1; then
+    echo "❌ 未检测到 curl"
+    exit 1
+fi
+
+# ============================================================
+# 1. 先测试真实上游
+# ============================================================
+
+echo "===== 1. 测试上游 ====="
+
+HTTP_CODE="$(
+    curl -sS \
+        --connect-timeout 5 \
+        --max-time 20 \
+        -o /tmp/ai-upstream-test \
+        -w '%{http_code}' \
+        "$UPSTREAM/v1/models" \
+        -H "Authorization: Bearer $UPSTREAM_KEY" \
+        || true
+)"
+
+echo "上游 HTTP 状态码: ${HTTP_CODE:-连接失败}"
+
+case "$HTTP_CODE" in
+    2??)
+        echo "✅ 上游连接和 Key 正常"
+        ;;
+    401|403)
+        echo "❌ 上游拒绝认证，请检查上游真实 API Key"
+        exit 1
+        ;;
+    000|"")
+        echo "❌ 无法连接上游：$UPSTREAM"
+        exit 1
+        ;;
+    *)
+        echo "❌ 上游返回异常 HTTP $HTTP_CODE"
+        echo
+        echo "返回内容："
+        head -c 1000 /tmp/ai-upstream-test 2>/dev/null || true
+        echo
+        exit 1
+        ;;
+esac
+
+# ============================================================
+# 2. 清理旧版本
+# ============================================================
+
+echo
+echo "===== 2. 清理旧版本 ====="
+
+docker rm -f "$NAME" >/dev/null 2>&1 || true
+
+rm -rf "$DIR"
+mkdir -p "$DIR"
+
+# ============================================================
+# 3. 生成 Nginx 配置
+#
+# 注意：
+# 不使用 map。
+# 长 API Key 使用 map 会遇到：
+# could not build map_hash
+# ============================================================
+
+cat >"$DIR/nginx.conf" <<EOF
+worker_processes auto;
+
+error_log /dev/stderr warn;
+
+events {
+    worker_connections 4096;
+}
+
+http {
+    access_log off;
+
+    server {
+        listen ${PORT};
+
+        client_max_body_size 200m;
+
+        location / {
+
+            # 校验客户端自定义 API Key
+            if (\$http_authorization != "Bearer ${CLIENT_KEY}") {
+                return 401 '{"error":{"message":"Invalid API key","type":"authentication_error"}}';
+            }
+
+            # 原样转发路径到上游
+            proxy_pass ${UPSTREAM};
+
+            proxy_http_version 1.1;
+
+            # 把客户端 Key 替换成真实上游 Key
+            proxy_set_header Authorization "Bearer ${UPSTREAM_KEY}";
+
+            # 上游是本机 65530
+            proxy_set_header Host 127.0.0.1:65530;
+
+            # 避免 Connection 头影响流式输出
+            proxy_set_header Connection "";
+
+            # 保留来源信息
+            proxy_set_header X-Real-IP \$remote_addr;
+            proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto \$scheme;
+
+            # AI / SSE / Streaming
+            proxy_buffering off;
+            proxy_request_buffering off;
+            proxy_cache off;
+            gzip off;
+
+            proxy_connect_timeout 15s;
+            proxy_send_timeout 3600s;
+            proxy_read_timeout 3600s;
+
+            add_header X-Accel-Buffering no always;
+        }
+    }
+}
+EOF
+
+chmod 600 "$DIR/nginx.conf"
+
+echo "✅ 配置已生成"
+
+# ============================================================
+# 4. 拉取镜像
+# ============================================================
+
+echo
+echo "===== 3. 拉取 Nginx ====="
+
+docker pull nginx:alpine
+
+# ============================================================
+# 5. 正式启动前检查 nginx.conf
+# ============================================================
+
+echo
+echo "===== 4. 检查 Nginx 配置 ====="
+
+if ! docker run --rm \
+    -v "$DIR/nginx.conf:/etc/nginx/nginx.conf:ro" \
+    nginx:alpine \
+    nginx -t
+then
+    echo
+    echo "❌ Nginx 配置检查失败"
+    exit 1
+fi
+
+echo "✅ Nginx 配置正确"
+
+# ============================================================
+# 6. 检查端口
+# ============================================================
+
+echo
+echo "===== 5. 检查 $PORT 端口 ====="
+
+if ss -lnt 2>/dev/null | grep -qE ":${PORT}[[:space:]]"; then
+    echo "❌ $PORT 端口已经被占用"
+    echo
+    ss -lntp | grep ":${PORT}" || true
+    exit 1
+fi
+
+echo "✅ $PORT 端口可用"
+
+# ============================================================
+# 7. 启动容器
+#
+# 使用 host 网络的原因：
+#
+# 容器需要访问宿主机：
+# 127.0.0.1:65530
+#
+# 如果使用普通 bridge 网络，
+# 容器里的 127.0.0.1 指向容器自身。
+# ============================================================
+
+echo
+echo "===== 6. 启动反代 ====="
+
+docker run -d \
+    --name "$NAME" \
+    --network host \
+    -v "$DIR/nginx.conf:/etc/nginx/nginx.conf:ro" \
+    nginx:alpine >/dev/null
+
+sleep 2
+
+# ============================================================
+# 8. 检查容器状态
+# ============================================================
+
+if [ "$(docker inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null || true)" != "true" ]; then
+    echo
+    echo "❌ 容器启动失败"
+    echo
+    echo "===== Docker 日志 ====="
+    docker logs "$NAME" || true
+    exit 1
+fi
+
+echo "✅ 容器运行正常"
+
+# ============================================================
+# 9. 检查端口监听
+# ============================================================
+
+if ! ss -lnt 2>/dev/null | grep -qE ":${PORT}[[:space:]]"; then
+    echo
+    echo "❌ 容器正在运行，但是 $PORT 没有监听"
+    echo
+    echo "===== Docker 日志 ====="
+    docker logs "$NAME" || true
+    exit 1
+fi
+
+echo "✅ 0.0.0.0:$PORT 已成功监听"
+
+# ============================================================
+# 10. 错误 Key 测试
+# ============================================================
+
+echo
+echo "===== 7. 测试客户端鉴权 ====="
+
+BAD_CODE="$(
+    curl -s \
+        --max-time 10 \
+        -o /dev/null \
+        -w '%{http_code}' \
+        "http://127.0.0.1:${PORT}/v1/models" \
+        -H "Authorization: Bearer this-is-definitely-wrong-key" \
+        || true
+)"
+
+if [ "$BAD_CODE" != "401" ]; then
+    echo "❌ 错误 Key 应返回 401，实际返回：$BAD_CODE"
+    docker rm -f "$NAME" >/dev/null 2>&1 || true
+    exit 1
+fi
+
+echo "✅ 错误 Key 已正确拒绝"
+
+# ============================================================
+# 11. 正确 Key 测试
+# ============================================================
+
+GOOD_CODE="$(
+    curl -sS \
+        --connect-timeout 5 \
+        --max-time 30 \
+        -o /tmp/ai-proxy-test \
+        -w '%{http_code}' \
+        "http://127.0.0.1:${PORT}/v1/models" \
+        -H "Authorization: Bearer ${CLIENT_KEY}" \
+        || true
+)"
+
+echo "正确 Key HTTP 状态码: ${GOOD_CODE:-失败}"
+
+case "$GOOD_CODE" in
+    2??)
+        echo "✅ API 反代测试成功"
+        ;;
+    *)
+        echo
+        echo "❌ API 反代测试失败"
+        echo
+        echo "===== 返回内容 ====="
+        head -c 1500 /tmp/ai-proxy-test 2>/dev/null || true
+        echo
+        echo "===== Docker 日志 ====="
+        docker logs --tail 100 "$NAME" || true
+        exit 1
+        ;;
+esac
+
+# ============================================================
+# 12. 全部成功后开启 Docker 自动重启
+# ============================================================
+
+docker update --restart unless-stopped "$NAME" >/dev/null
+
+echo
+echo "===== 8. 自动启动 ====="
+
+RESTART_POLICY="$(
+    docker inspect \
+        -f '{{.HostConfig.RestartPolicy.Name}}' \
+        "$NAME"
+)"
+
+echo "Docker Restart Policy: $RESTART_POLICY"
+
+if [ "$RESTART_POLICY" = "unless-stopped" ]; then
+    echo "✅ 容器已设置自动启动"
+else
+    echo "⚠️ 自动启动策略设置异常"
+fi
+
+# ============================================================
+# 完成
+# ============================================================
+
+echo
+echo "========================================"
+echo "             ✅ 部署成功"
+echo "========================================"
+echo
+echo "监听："
+echo "  0.0.0.0:${PORT}"
+echo
+echo "客户端 Base URL："
+echo "  http://服务器IP:${PORT}/v1"
+echo
+echo "客户端 API Key："
+echo "  ${CLIENT_KEY}"
+echo
+echo "内部上游："
+echo "  ${UPSTREAM}"
+echo
+echo "工作流程："
+echo
+echo "  客户端"
+echo "    │"
+echo "    │ Bearer ${CLIENT_KEY}"
+echo "    ▼"
+echo "  服务器:${PORT}"
+echo "    │"
+echo "    │ 自动替换 Authorization"
+echo "    ▼"
+echo "  ${UPSTREAM}"
+echo "    │"
+echo "    │ Bearer [真实上游Key]"
+echo "    ▼"
+echo "  AI API"
+echo
+
+echo "===== /v1/models 返回 ====="
+head -c 1500 /tmp/ai-proxy-test
+echo
+echo
+
+echo "===== 监听状态 ====="
+ss -lntp | grep ":${PORT}" || true
+
+echo
+echo "===== Docker 状态 ====="
+docker ps --filter "name=${NAME}"
+
+echo
+echo "========================================"
+echo "常用命令"
+echo "========================================"
+echo
+echo "查看状态："
+echo "  docker ps --filter name=${NAME}"
+echo
+echo "查看日志："
+echo "  docker logs --tail 100 ${NAME}"
+echo
+echo "重启："
+echo "  docker restart ${NAME}"
+echo
+echo "停止："
+echo "  docker stop ${NAME}"
+echo
+echo "重新启动："
+echo "  docker start ${NAME}"
+echo
+echo "配置文件："
+echo "  ${DIR}/nginx.conf"
+echo
