@@ -165,6 +165,17 @@ http {
             # 原样转发路径到上游
             proxy_pass ${UPSTREAM};
 
+            # CloudStudio Preview 流式兼容：
+            # 实测这些上游网关响应头会触发 Preview 对 SSE 整段聚合。
+            # 隐藏后公网 Preview 恢复逐 chunk 真流式。
+            proxy_hide_header Set-Cookie;
+            proxy_hide_header EO-Cache-Status;
+            proxy_hide_header EO-LOG-UUID;
+            proxy_hide_header traceid;
+            proxy_hide_header X-Content-Type-Options;
+            proxy_hide_header X-Request-ID;
+            proxy_hide_header X-User-ID;
+
             proxy_http_version 1.1;
 
             # 把客户端 Key 替换成真实上游 Key
